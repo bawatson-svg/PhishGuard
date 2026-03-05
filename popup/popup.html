@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PhishGuard</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+
+<body>
+  <div class="app">
+    <div class="container" role="application" aria-label="PhishGuard Email Phishing Analyzer">
+      <!-- Header -->
+      <header class="header">
+        <div class="brand-row">
+          <div class="brand">
+            <div class="logo" aria-hidden="true">🛡️</div>
+            <div class="brand-text">
+              <h1>PhishGuard</h1>
+              <p class="tagline">Email Phishing Analyzer</p>
+            </div>
+          </div>
+
+          <a class="help-link" href="#guidance-modal" aria-label="Open user guidance and policies">
+            Help / Policies
+          </a>
+        </div>
+
+        <div class="gmu-stripe" aria-hidden="true"></div>
+
+        <div class="header-meta">
+          <span class="subtle">Privacy-first</span>
+          <span class="meta-dot" aria-hidden="true">•</span>
+          <span class="subtle">Analyze only when you click</span>
+        </div>
+      </header>
+
+      <!-- Main Content -->
+      <main class="main">
+        <section id="idle-state" class="state active" aria-live="polite">
+          <div class="hero">
+            <h2 class="hero-title">Check for phishing signals</h2>
+            <p class="hero-subtitle">Analyzes indicators and returns a risk score + guidance.</p>
+          </div>
+
+          <div class="cta-wrap">
+            <button id="analyze-btn" class="btn btn-primary btn-pill" type="button">
+              <span class="btn-icon" aria-hidden="true">🔍</span>
+              <span class="btn-text">Analyze Email</span>
+            </button>
+          </div>
+
+          <p class="hint">Click to check if this email is safe</p>
+
+          <div class="micro">
+            <div class="micro-item">
+              <span class="micro-dot ok" aria-hidden="true"></span>
+              <span>No data stored</span>
+            </div>
+            <div class="micro-item">
+              <span class="micro-dot warn" aria-hidden="true"></span>
+              <span>Verify links & sender</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Analyzing State -->
+        <section id="analyzing-state" class="state" aria-live="polite">
+          <div class="loading-card">
+            <div class="spinner" aria-hidden="true"></div>
+            <p class="status-text">Analyzing...</p>
+            <p class="status-subtext">Checking URLs, metadata, and social-engineering cues</p>
+          </div>
+        </section>
+
+        <!-- Results State -->
+        <section id="results-state" class="state" aria-live="polite">
+          <div class="results-top">
+            <div class="risk-meter">
+              <div class="risk-score-circle">
+                <svg viewBox="0 0 100 100" aria-hidden="true">
+                  <circle class="risk-bg" cx="50" cy="50" r="45"></circle>
+                  <circle class="risk-fill" cx="50" cy="50" r="45" style="--risk-percent: 0"></circle>
+                </svg>
+
+                <div class="risk-score-text" aria-label="Risk score">
+                  <span id="risk-score">0</span><span class="percent">%</span>
+                </div>
+              </div>
+
+              <p id="risk-level" class="risk-level" data-level="low">Safe</p>
+              <p class="risk-caption">Higher score = more phishing indicators detected.</p>
+            </div>
+          </div>
+
+          <div class="details-section">
+            <button id="toggle-details" class="btn-toggle" type="button" aria-expanded="false">
+              <span>View Details</span>
+              <span class="arrow" aria-hidden="true">▼</span>
+            </button>
+
+            <div id="details-content" class="details-content" aria-hidden="true">
+              <div class="score-breakdown">
+                <div class="breakdown-item">
+                  <span class="label">Rule-Based Score</span>
+                  <span id="rule-score" class="value">0%</span>
+                </div>
+                <div class="breakdown-item">
+                  <span class="label">AI Analysis Score</span>
+                  <span id="llm-score" class="value">0%</span>
+                </div>
+              </div>
+
+              <div class="indicators-section">
+                <h3>Detected Indicators</h3>
+                <ul id="indicators-list" class="indicators-list"></ul>
+              </div>
+            </div>
+          </div>
+
+          <div class="actions">
+            <button id="analyze-again-btn" class="btn btn-secondary" type="button">Analyze Another</button>
+          </div>
+        </section>
+
+        <!-- Error State -->
+        <section id="error-state" class="state" aria-live="assertive">
+          <div class="error-card">
+            <div class="error-icon" aria-hidden="true">⚠️</div>
+            <h2 class="error-title">Analysis Failed</h2>
+            <p id="error-message" class="error-message">Something went wrong</p>
+            <button id="retry-btn" class="btn btn-secondary" type="button">Try Again</button>
+          </div>
+        </section>
+      </main>
+
+      <!-- Footer -->
+      <footer class="footer">
+        <p class="privacy-note">🔒 Privacy-first • No data stored</p>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Modal (policies)-->
+  <div id="guidance-modal" class="modal" role="dialog" aria-modal="true" aria-label="User guidance and policies">
+    <a class="modal-backdrop" href="#" aria-label="Close modal"></a>
+
+    <div class="modal-card" role="document">
+      <div class="modal-header">
+        <h2 class="modal-title">User Guidance & Policies</h2>
+        <a class="modal-close" href="#" aria-label="Close">✕</a>
+      </div>
+
+      <div class="modal-body">
+        <div class="modal-section">
+          <h3>What PhishGuard does</h3>
+          <ul>
+            <li>Analyzes URLs, webpage/email metadata, and social-engineering signals.</li>
+            <li>Returns a <strong>risk score (0–100)</strong> and a category: <strong>Legitimate / Suspicious / Phishing</strong>.</li>
+            <li>Provides evidence-based explanation + recommended action.</li>
+          </ul>
+        </div>
+
+        <div class="modal-section">
+          <h3>Privacy-first rules</h3>
+          <ul>
+            <li><strong>No long-term storage</strong> of email/webpage content.</li>
+            <li><strong>No external enrichment</strong> of user data.</li>
+            <li>Analysis runs <strong>only when you click “Analyze”</strong>.</li>
+            <li><strong>Minimal data</strong> is sent to the LLM (if enabled by your workflow).</li>
+          </ul>
+        </div>
+
+        <div class="modal-section">
+          <h3>How to respond</h3>
+          <ul>
+            <li>If <strong>Suspicious/Phishing</strong>: don’t click links, don’t enter credentials, verify sender via official channels.</li>
+            <li>Inspect domains for look-alikes (typosquatting).</li>
+            <li>Watch for urgency language (e.g., “within 24 hours”).</li>
+          </ul>
+        </div>
+
+        <div class="modal-section">
+          <h3>Disclaimer</h3>
+          <p class="modal-muted">
+            PhishGuard is a research prototype for academic purposes. It does not replace enterprise-grade security tools.
+          </p>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <a class="btn btn-secondary" href="#">Got it</a>
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
