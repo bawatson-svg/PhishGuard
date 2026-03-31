@@ -562,6 +562,35 @@ body{
   overflow: hidden;
 }
 
+.ai-section{
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid rgba(15,23,42,0.10);
+  border-radius: 14px;
+  background: rgba(0,102,51,0.04);
+}
+
+.ai-section h3{
+  font-size: 13px;
+  font-weight: 950;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+.ai-explanation{
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+  margin-bottom: 10px;
+}
+
+.ai-recommendation{
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--gmu-green-700);
+  font-weight: 800;
+}
+
 .modal-header{
   padding: 14px 14px 10px;
   border-bottom: 1px solid rgba(15,23,42,0.10);

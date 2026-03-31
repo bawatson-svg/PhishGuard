@@ -1,3 +1,4 @@
+importScripts('phishing-features.js', 'ai-assistance.js');
 // PhishGuard Service Worker - Rule-based detection + Google Safe Browsing reputation checks
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -5,7 +6,7 @@
 // To enable Safe Browsing lookups, replace this with your real API key from:
 // https://console.cloud.google.com/ → enable "Safe Browsing API" → create credentials
 // If this stays as the placeholder, we just skip reputation checks entirely (no error).
-const SAFE_BROWSING_API_KEY = 'PLEASE ADD YOUR API HERE';
+const SAFE_BROWSING_API_KEY = 'AIzaSyAm-U-SNIPUKwCysxnxisBgnJm-qG1FAKI';
 
 // how long to keep email analysis results cached (5 min)
 const CACHE_DURATION = 5 * 60 * 1000;
@@ -47,10 +48,12 @@ async function handleAnalyzeEmail(emailData) {
 
     // step 1: run our local rule-based checks (fast, no network)
     const analysis = runRuleBasedAnalysis(emailData);
-
-    // step 2: pull out plain URL strings from links (handles both old string format
-    // and new object format — see normalizeLinks() below)
     const urls = normalizeLinks(emailData.links);
+    const pureRuleScore = analysis.score;  // ← save before dataset adds to it
+
+    const datasetResult = await runDatasetChecks(emailData, urls);
+    analysis.score     += datasetResult.score;
+    analysis.indicators = [...analysis.indicators, ...datasetResult.indicators];
 
     // step 3: check those URLs against Google Safe Browsing (slow, network, may fail)
     // we do this after rule-based so a network failure doesn't block everything
@@ -78,13 +81,24 @@ async function handleAnalyzeEmail(emailData) {
     // have the "looks safe" message (it gets added in runRuleBasedAnalysis already,
     // but double-check since we might have added SB indicators after the fact)
     const result = {
-      riskScore:  finalScore,
-      riskLevel:  getRiskLevel(finalScore),
-      ruleScore:  analysis.score,
-      llmScore:   0,
-      indicators: allIndicators,
-      timestamp:  Date.now()
+      riskScore:    finalScore,
+      riskLevel:    getRiskLevel(finalScore),
+      ruleScore:    pureRuleScore,
+      datasetScore: datasetResult.score,
+      llmScore:     0,
+      indicators:   allIndicators,
+      aiExplanation: '',
+      aiRecommendation: '',
+      timestamp:    Date.now()
     };
+
+    try {
+      const aiResult = await generateAIExplanation(result, emailData);
+      result.aiExplanation = aiResult.explanation || '';
+      result.aiRecommendation = aiResult.recommendation || '';
+    } catch (err) {
+      console.warn('[PhishGuard AI] Failed to attach AI explanation:', err.message);
+    }
 
     analysisCache.set(cacheKey, { result, timestamp: Date.now() });
     cleanCache();
@@ -122,7 +136,7 @@ function normalizeLinks(links) {
 
 async function checkSafeBrowsing(urls) {
   // if no API key is set, just silently skip — rules-only mode is still useful
-  if (!SAFE_BROWSING_API_KEY || SAFE_BROWSING_API_KEY === 'YOUR_API_KEY_HERE') {
+  if (!SAFE_BROWSING_API_KEY || SAFE_BROWSING_API_KEY === 'AIzaSyAm-U-SNIPUKwCysxnxisBgnJm-qG1FAKI') {
     return {};
   }
 
@@ -246,8 +260,9 @@ function runRuleBasedAnalysis(emailData) {
   // links are now objects with { href, text, title, displayedDomain, actualDomain }
   // we pull out .href for all the string-based checks, same as before
   if (emailData.links && emailData.links.length > 0) {
+    const firedBrands = new Set();
+
     emailData.links.forEach(link => {
-      // support both the old string format and the new object format, just in case
       const url = typeof link === 'string' ? link : (link.href || '');
       if (!url) return;
 
@@ -266,12 +281,14 @@ function runRuleBasedAnalysis(emailData) {
         totalScore += 10;
       }
 
-      const commonBrands = ['paypal', 'amazon', 'microsoft', 'apple', 'google', 'facebook', 'bank'];
+      const commonBrands = ['paypal', 'amazon', 'microsoft', 'apple', 'facebook', 'bank'];
       commonBrands.forEach(brand => {
+        if (firedBrands.has(brand)) return;
         const typoPattern = new RegExp(brand.replace(/o/g, '[o0]').replace(/l/g, '[l1]').replace(/a/g, '[a4]'), 'i');
-        if (typoPattern.test(url) && !url.toLowerCase().includes(brand + '.com')) {
+        if (typoPattern.test(url) && !url.toLowerCase().includes(brand + '.com') && !url.includes('google.com/url')) {
           indicators.push(`🚨 Possible ${brand.toUpperCase()} brand impersonation in URL`);
           totalScore += 25;
+          firedBrands.add(brand);
         }
       });
 
@@ -313,6 +330,18 @@ function runRuleBasedAnalysis(emailData) {
       indicators.push('⚠️ Display name does not match sender domain');
       totalScore += 18;
     }
+  }
+  
+  if (/\.(biz|info|xyz|top|click|link)\.\w{2}$/.test(emailDomain) ||
+      /\.(biz|info|xyz|top|click)$/.test(emailDomain)) {
+    indicators.push('⚠️ Sender uses suspicious domain structure');
+    totalScore += 15;
+  }
+
+  // Excessive subdomains in sender domain (more than 3 dots)
+  if ((emailDomain.match(/\./g) || []).length > 3) {
+    indicators.push('🚨 Sender domain has excessive subdomains');
+    totalScore += 20;
   }
 
   // Content Analysis (30 points)

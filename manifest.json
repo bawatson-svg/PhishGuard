@@ -9,7 +9,9 @@
     "scripting"
   ],
   "host_permissions": [
-    "https://mail.google.com/*"
+  "https://mail.google.com/*",
+  "https://phishstats.info/*",
+  "https://openphish.com/*"
   ],
   "action": {
     "default_popup": "popup/popup.html",

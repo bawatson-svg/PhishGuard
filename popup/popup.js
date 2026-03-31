@@ -117,8 +117,8 @@ function displayResults(result) {
   riskLevelElem.setAttribute('data-level', riskLevel);
   
   document.getElementById('rule-score').textContent = `${Math.round(result.ruleScore)}%`;
-  document.getElementById('llm-score').textContent = result.llmScore > 0 ? `${Math.round(result.llmScore)}%` : 'N/A';
-  
+  document.getElementById('dataset-score').textContent = result.datasetScore > 0 ? `+${Math.round(result.datasetScore)}` : '0';
+
   const indicatorsList = document.getElementById('indicators-list');
   indicatorsList.innerHTML = '';
   
@@ -143,6 +143,15 @@ function displayResults(result) {
   }
   
   setState('results');
+
+  const aiExplanationEl = document.getElementById('ai-explanation');
+  const aiRecommendationEl = document.getElementById('ai-recommendation');
+
+  aiExplanationEl.textContent =
+    result.aiExplanation || 'No AI explanation available.';
+
+  aiRecommendationEl.textContent =
+    result.aiRecommendation || 'No recommendation available.';
 }
 
 function getRiskLevel(score) {
