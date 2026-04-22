@@ -116,8 +116,8 @@ function displayResults(result) {
   riskLevelElem.textContent = getRiskLevelText(riskLevel);
   riskLevelElem.setAttribute('data-level', riskLevel);
   
-  document.getElementById('rule-score').textContent = `${Math.round(result.ruleScore)}%`;
-  document.getElementById('dataset-score').textContent = result.datasetScore > 0 ? `+${Math.round(result.datasetScore)}` : '0';
+  document.getElementById('rule-score').textContent = `${Math.round(result.breakdown.heuristicScore)}%`;
+  document.getElementById('dataset-score').textContent = result.breakdown.datasetScore > 0 ? `+${Math.round(result.breakdown.datasetScore)}%` : '0%';
 
   const indicatorsList = document.getElementById('indicators-list');
   indicatorsList.innerHTML = '';

@@ -1,24 +1,78 @@
 importScripts('phishing-features.js', 'ai-assistance.js');
-// PhishGuard Service Worker - Rule-based detection + Google Safe Browsing reputation checks
+// ─── PhishGuard Service Worker ────────────────────────────────────────────────
+//
+// ROLE: Coordinator.  No regex / keyword / scoring logic lives here.
+//       See phishing-features.js for the heuristic layer.
+//
+// PIPELINE (per email):
+//   1. runHeuristicAnalysis()    — local, instant, no network
+//   2. runDatasetChecks()        — PhishTank + OpenPhish feed lookups
+//   3. checkExternalReputation() — Google Safe Browsing + URLhaus (this file)
+//      ├─ checkSafeBrowsing()    — Google v4 API, batched, cached, key required
+//      └─ checkCommunityBlacklist() — URLhaus API, no key needed, per-URL
+//
+// CACHE STRATEGY:
+//   analysisCache    — full result per email, keyed on sender+subject+body prefix
+//   reputationCache  — per-URL result combining both external sources
+//     TTL tiers:
+//       MALICIOUS URL  → 60 min (stable signal; no point re-checking soon)
+//       CLEAN URL      → 15 min (clean verdicts go stale faster; feeds update)
+//       API ERROR      →  2 min (retry quickly after a transient failure)
+//
+// FAIL-SAFE CONTRACT:
+//   Every external call is wrapped so that a network error, timeout, bad API key,
+//   or malformed response returns { malicious: false } rather than crashing.
+//   Warnings are logged to the service worker console; the UI always gets a result.
+// ─────────────────────────────────────────────────────────────────────────────
+
+'use strict';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-// To enable Safe Browsing lookups, replace this with your real API key from:
-// https://console.cloud.google.com/ → enable "Safe Browsing API" → create credentials
-// If this stays as the placeholder, we just skip reputation checks entirely (no error).
+// Replace with your key from https://console.cloud.google.com/
+// → enable "Safe Browsing API" → Credentials → Create API Key
+// Leave as placeholder to run in heuristics-only mode (no crash, just a warning).
 const SAFE_BROWSING_API_KEY = 'AIzaSyAm-U-SNIPUKwCysxnxisBgnJm-qG1FAKI';
 
-// how long to keep email analysis results cached (5 min)
-const CACHE_DURATION = 5 * 60 * 1000;
+const SAFE_BROWSING_ENDPOINT =
+  'https://safebrowsing.googleapis.com/v4/threatMatches:find';
 
-// separate, longer cache for Safe Browsing results — no need to re-check the same
-// URL every time, and the API has rate limits we don't want to burn through
-const SB_CACHE_DURATION = 10 * 60 * 1000; // 10 minutes
+// URLhaus — free community feed run by abuse.ch, no key required.
+// Docs: https://urlhaus-api.abuse.ch/
+const URLHAUS_ENDPOINT = 'https://urlhaus-api.abuse.ch/v1/url/';
+
+// Cache TTLs
+const CACHE_DURATION           =  5 * 60 * 1000; // 5 min  — full email analysis
+const REPUTATION_TTL_MALICIOUS = 60 * 60 * 1000; // 60 min — confirmed bad URL
+const REPUTATION_TTL_CLEAN     = 15 * 60 * 1000; // 15 min — clean URL
+const REPUTATION_TTL_ERROR     =  2 * 60 * 1000; //  2 min — retry after API error
+
+// Network timeouts
+const TIMEOUT_SAFE_BROWSING_MS = 5000; // 5 s — single batched POST
+const TIMEOUT_URLHAUS_MS       = 4000; // 4 s — per-URL POST
+
+// Score weights for external reputation hits.
+// Heuristic weights live in RULE_CONFIG in phishing-features.js.
+const EXTERNAL_SCORES = {
+  safeBrowsingMalicious:    40, // Google confirmed malicious (fresh signal)
+  urlhausMalicious:         35, // Community confirmed malicious (fresh signal)
+  bothSourcesMalicious:     55, // Both agree — stronger, but NOT simply additive
+  safeBrowsingConfirmBonus: 10, // SB confirms what heuristics already caught
+  urlhausConfirmBonus:       8, // URLhaus confirms what heuristics already caught
+};
+
+// Google Safe Browsing threat types we care about.
+const SB_THREAT_TYPES = [
+  'MALWARE',
+  'SOCIAL_ENGINEERING',       // phishing falls under this category
+  'UNWANTED_SOFTWARE',
+  'POTENTIALLY_HARMFUL_APPLICATION',
+];
 
 // ─── Caches ───────────────────────────────────────────────────────────────────
 
-const analysisCache  = new Map(); // full email analysis results
-const sbCache        = new Map(); // Safe Browsing results keyed by URL
+const analysisCache   = new Map(); // full email analysis results
+const reputationCache = new Map(); // per-URL unified verdict { verdict, timestamp, ttl }
 
 // ─── Message listener ─────────────────────────────────────────────────────────
 
@@ -27,74 +81,73 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     handleAnalyzeEmail(message.data)
       .then(sendResponse)
       .catch(error => sendResponse({ error: error.message }));
-    return true; // tell Chrome we'll call sendResponse asynchronously
+    return true; // async response
   }
 });
 
-// ─── Main handler ─────────────────────────────────────────────────────────────
+// ─── Main coordinator ─────────────────────────────────────────────────────────
 
 async function handleAnalyzeEmail(emailData) {
   try {
-    if (!emailData || !emailData.sender || !emailData.subject || !emailData.body) {
-      throw new Error('Incomplete email data');
+    if (!emailData?.sender || !emailData?.subject || !emailData?.body) {
+      throw new Error('Incomplete email data — sender, subject, and body are required');
     }
 
-    // check if we already analyzed this exact email recently
+    // Full-analysis cache check
     const cacheKey = generateCacheKey(emailData);
-    const cached = analysisCache.get(cacheKey);
+    const cached   = analysisCache.get(cacheKey);
     if (cached && (Date.now() - cached.timestamp < CACHE_DURATION)) {
       return cached.result;
     }
 
-    // step 1: run our local rule-based checks (fast, no network)
-    const analysis = runRuleBasedAnalysis(emailData);
     const urls = normalizeLinks(emailData.links);
-    const pureRuleScore = analysis.score;  // ← save before dataset adds to it
 
-    const datasetResult = await runDatasetChecks(emailData, urls);
-    analysis.score     += datasetResult.score;
-    analysis.indicators = [...analysis.indicators, ...datasetResult.indicators];
+    // ── Layer 1: Heuristic (phishing-features.js) ─────────────────────────────
+    // All regex / keyword / pattern checks. Instant, no network.
+    // Returns { score, indicators, flags }.
+    // flags is a de-duplication contract read by Layer 3 to avoid double-counting.
+    const heuristic = runHeuristicAnalysis(emailData);
 
-    // step 3: check those URLs against Google Safe Browsing (slow, network, may fail)
-    // we do this after rule-based so a network failure doesn't block everything
-    const sbResults = await checkSafeBrowsing(urls);
+    // ── Layer 2: Dataset feed lookups (phishing-features.js) ─────────────────
+    // PhishTank + OpenPhish blacklist checks + Nazario sender patterns.
+    // Non-overlapping with Layer 1 by design.
+    const dataset = await runDatasetChecks(emailData, urls);
 
-    // step 4: fold Safe Browsing findings into the score and indicators
-    let extraScore = 0;
-    const sbIndicators = [];
+    // ── Layer 3: External reputation (this file) ──────────────────────────────
+    // Google Safe Browsing (batched) → URLhaus (per-URL, only for SB-clean URLs).
+    // Reads heuristic.flags to apply de-duplication on overlapping signals.
+    const external = await checkExternalReputation(urls, heuristic.flags);
 
-    for (const [url, result] of Object.entries(sbResults)) {
-      if (result.malicious) {
-        // +40 per confirmed-malicious URL — this is a very strong signal since
-        // Safe Browsing is backed by Google's actual threat intelligence database
-        extraScore += 40;
-        const threats = result.threatTypes.join(', ');
-        sbIndicators.push(`🚨 Safe Browsing flagged malicious URL (${threats}): ${url}`);
-      }
-    }
+    // ── Aggregate ─────────────────────────────────────────────────────────────
+    const totalScore = Math.min(
+      heuristic.score + dataset.score + external.score,
+      100
+    );
 
-    // merge everything together
-    const finalScore = Math.min(analysis.score + extraScore, 100);
-    const allIndicators = [...analysis.indicators, ...sbIndicators];
+    const allIndicators = [
+      ...heuristic.indicators,
+      ...dataset.indicators,
+      ...external.indicators,
+    ];
 
-    // if rule-based came back clean but SB found nothing either, make sure we still
-    // have the "looks safe" message (it gets added in runRuleBasedAnalysis already,
-    // but double-check since we might have added SB indicators after the fact)
     const result = {
-      riskScore:    finalScore,
-      riskLevel:    getRiskLevel(finalScore),
-      ruleScore:    pureRuleScore,
-      datasetScore: datasetResult.score,
-      llmScore:     0,
-      indicators:   allIndicators,
-      aiExplanation: '',
+      riskScore:  totalScore,
+      riskLevel:  getRiskLevel(totalScore),
+      breakdown: {
+        heuristicScore: heuristic.score,
+        datasetScore:   dataset.score,
+        externalScore:  external.score,
+      },
+      indicators:        allIndicators,
+      aiExplanation:    '',
       aiRecommendation: '',
-      timestamp:    Date.now()
+      timestamp:         Date.now(),
     };
 
+    // ── Optional: AI explanation ──────────────────────────────────────────────
     try {
       const aiResult = await generateAIExplanation(result, emailData);
-      result.aiExplanation = aiResult.explanation || '';
+      result.aiExplanation    = aiResult.explanation    || '';
       result.aiRecommendation = aiResult.recommendation || '';
     } catch (err) {
       console.warn('[PhishGuard AI] Failed to attach AI explanation:', err.message);
@@ -106,302 +159,380 @@ async function handleAnalyzeEmail(emailData) {
     return result;
 
   } catch (error) {
-    console.error('Analysis error:', error);
+    console.error('[PhishGuard] Analysis error:', error);
     throw error;
   }
 }
 
-// ─── Link normalization ───────────────────────────────────────────────────────
+// ─── External reputation orchestrator ────────────────────────────────────────
+//
+// Coordinates Safe Browsing and URLhaus in a single pass:
+//
+//   1. Pull anything still valid from reputationCache immediately.
+//   2. For uncached URLs, run Safe Browsing (one batched request).
+//   3. For URLs that SB returned CLEAN, run URLhaus (parallel per-URL).
+//      We deliberately skip URLhaus for SB-confirmed-malicious URLs — the
+//      verdict is already certain and URLhaus calls are per-URL (slower).
+//   4. Merge the two verdicts, write to reputationCache, and score.
+//
+// heuristicFlags prevents double-counting: if the heuristic layer already
+// flagged brand impersonation for a URL, an external hit on that same URL
+// earns a smaller "confirmation bonus" rather than the full fresh-signal weight.
 
-// gmail-parser.js might give us links as plain strings (old format) or as objects
-// with { href, text, ... } (new format). This just flattens them to URL strings
-// so Safe Browsing and any other URL-based checks have a consistent input.
-function normalizeLinks(links) {
-  if (!links || links.length === 0) return [];
+async function checkExternalReputation(urls, heuristicFlags) {
+  if (urls.length === 0) return { score: 0, indicators: [] };
 
-  return links
-    .map(link => typeof link === 'string' ? link : (link.href || ''))
-    .filter(url => url.length > 0); // drop any blanks
+  const indicators = [];
+  let score = 0;
+
+  // ── Step 1: reputation cache ──────────────────────────────────────────────
+  const { cached: cachedVerdicts, unchecked } = partitionByCacheState(urls);
+
+  for (const [url, verdict] of Object.entries(cachedVerdicts)) {
+    const { points, label } = scoreSingleVerdict(url, verdict, heuristicFlags);
+    score += points;
+    if (label) indicators.push(label);
+  }
+
+  if (unchecked.length === 0) {
+    return { score: Math.min(score, 80), indicators };
+  }
+
+  // ── Step 2: Google Safe Browsing (batched) ────────────────────────────────
+  const sbVerdicts = await checkSafeBrowsing(unchecked);
+
+  const sbMaliciousUrls = [];
+  const sbCleanUrls     = [];
+
+  for (const url of unchecked) {
+    (sbVerdicts[url]?.malicious ? sbMaliciousUrls : sbCleanUrls).push(url);
+  }
+
+  // ── Step 3: URLhaus — only for SB-clean URLs ──────────────────────────────
+  const urlhausVerdicts = await checkCommunityBlacklist(sbCleanUrls);
+
+  // ── Step 4: merge, cache, score ───────────────────────────────────────────
+  for (const url of unchecked) {
+    const sbV = sbVerdicts[url]      || { malicious: false, threatTypes: [], error: false };
+    const uhV = urlhausVerdicts[url] || { malicious: false, tags: [],       error: false };
+
+    const merged = mergeVerdicts(sbV, uhV);
+
+    const ttl = merged.malicious
+      ? REPUTATION_TTL_MALICIOUS
+      : (sbV.error || uhV.error ? REPUTATION_TTL_ERROR : REPUTATION_TTL_CLEAN);
+
+    reputationCache.set(url, { verdict: merged, timestamp: Date.now(), ttl });
+
+    const { points, label } = scoreSingleVerdict(url, merged, heuristicFlags);
+    score += points;
+    if (label) indicators.push(label);
+  }
+
+  return { score: Math.min(score, 80), indicators };
 }
 
-// ─── Google Safe Browsing lookup ──────────────────────────────────────────────
-
-// Google Safe Browsing is a free API (with rate limits) that checks URLs against
-// Google's database of known malware, phishing, and unwanted software sites.
-// Basically we send a list of URLs and Google tells us if any are flagged.
-// Docs: https://developers.google.com/safe-browsing/reference/rest/v4/threatMatches/find
+// ─── Google Safe Browsing v4 ─────────────────────────────────────────────────
 //
-// We batch all URLs into one request (API supports up to 500 at a time) to avoid
-// making a separate API call per link — that would be slow and burn our quota fast.
+// Sends one POST request for all URLs (up to 500 per API limit).
+// Returns: { [url]: { malicious: bool, threatTypes: string[], error: bool } }
+//
+// Fail-safe guarantees:
+//   • Missing / placeholder API key  → warn + return all clean (no crash)
+//   • HTTP 400 (bad URL format)      → warn + return all clean
+//   • HTTP 403 (bad key / quota)     → warn + return all clean
+//   • Other HTTP error               → warn + return all error-flagged (short TTL)
+//   • Network failure / timeout      → warn + return all error-flagged (short TTL)
 
 async function checkSafeBrowsing(urls) {
-  // if no API key is set, just silently skip — rules-only mode is still useful
+  // Default: assume clean for every URL
+  const results = Object.fromEntries(
+    urls.map(u => [u, { malicious: false, threatTypes: [], error: false }])
+  );
+
   if (!SAFE_BROWSING_API_KEY || SAFE_BROWSING_API_KEY === 'AIzaSyAm-U-SNIPUKwCysxnxisBgnJm-qG1FAKI') {
-    return {};
+    console.warn('[PhishGuard] Safe Browsing skipped — no API key configured. ' +
+      'Add your key to SAFE_BROWSING_API_KEY in service-worker.js');
+    return results;
   }
 
-  if (urls.length === 0) return {};
+  if (urls.length === 0) return results;
 
-  // figure out which URLs we already have cached so we don't re-check them
-  const now = Date.now();
-  const cachedResults = {};
-  const urlsToFetch = [];
-
-  for (const url of urls) {
-    const cached = sbCache.get(url);
-    if (cached && (now - cached.timestamp < SB_CACHE_DURATION)) {
-      cachedResults[url] = cached.data; // still fresh, use it
-    } else {
-      urlsToFetch.push(url); // expired or never checked, need to fetch
-    }
-  }
-
-  // if everything was cached, we're done — no network call needed
-  if (urlsToFetch.length === 0) {
-    return cachedResults;
-  }
-
-  // Safe Browsing supports up to 500 URLs per request, but just in case
-  // someone somehow has a wild email with a ton of links, slice it
-  const batch = urlsToFetch.slice(0, 500);
-
-  // set up a timeout so a slow/hung API call doesn't freeze the UI
-  // AbortController lets us cancel the fetch after N milliseconds
+  const batch      = urls.slice(0, 500); // API hard limit
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 4000); // 4 second timeout
+  const timeoutId  = setTimeout(() => controller.abort(), TIMEOUT_SAFE_BROWSING_MS);
 
   try {
     const response = await fetch(
-      `https://safebrowsing.googleapis.com/v4/threatMatches:find?key=${SAFE_BROWSING_API_KEY}`,
+      `${SAFE_BROWSING_ENDPOINT}?key=${SAFE_BROWSING_API_KEY}`,
       {
-        method: 'POST',
-        signal: controller.signal,
+        method:  'POST',
+        signal:  controller.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          // client block identifies our app to Google — required by the API
           client: {
             clientId:      'phishguard-extension',
-            clientVersion: '1.0.0'
+            clientVersion: '1.0.0',
           },
           threatInfo: {
-            // the four main threat categories we care about
-            threatTypes: [
-              'MALWARE',
-              'SOCIAL_ENGINEERING',        // this is what phishing falls under
-              'UNWANTED_SOFTWARE',
-              'POTENTIALLY_HARMFUL_APPLICATION'
-            ],
-            platformTypes:    ['ANY_PLATFORM'], // we don't care which OS, just flag it
+            threatTypes:      SB_THREAT_TYPES,
+            platformTypes:    ['ANY_PLATFORM'],
             threatEntryTypes: ['URL'],
-            threatEntries: batch.map(url => ({ url })) // [{ url: "https://..." }, ...]
-          }
-        })
+            threatEntries:    batch.map(url => ({ url })),
+          },
+        }),
       }
     );
 
     clearTimeout(timeoutId);
 
+    // ── HTTP error handling ────────────────────────────────────────────────
+    if (response.status === 400) {
+      console.warn('[PhishGuard] Safe Browsing 400 Bad Request — ' +
+        'one or more URLs may be malformed. Skipping this batch.');
+      return results; // clean — malformed URLs aren't a phishing signal
+    }
+
+    if (response.status === 403) {
+      console.warn('[PhishGuard] Safe Browsing 403 Forbidden — ' +
+        'check your API key is correct and has not exceeded its daily quota.');
+      return results;
+    }
+
     if (!response.ok) {
-      // API returned an error (bad key, quota exceeded, etc.) — log it and bail
-      console.warn('[PhishGuard] Safe Browsing API error:', response.status, response.statusText);
-      return cachedResults; // return whatever we had cached at least
+      console.warn(`[PhishGuard] Safe Browsing unexpected error: ${response.status} ${response.statusText}`);
+      // Error-flag so reputationCache uses the short TTL and we retry soon
+      return Object.fromEntries(
+        urls.map(u => [u, { malicious: false, threatTypes: [], error: true }])
+      );
+    }
+
+    // ── Parse response ─────────────────────────────────────────────────────
+    const data = await response.json();
+
+    // When nothing is flagged, the API omits 'matches' entirely (not an error).
+    if (data.matches?.length > 0) {
+      for (const match of data.matches) {
+        const matchedUrl = match.threat?.url;
+        if (matchedUrl && results[matchedUrl] !== undefined) {
+          results[matchedUrl].malicious = true;
+          results[matchedUrl].threatTypes.push(match.threatType);
+        }
+      }
+    }
+
+    return results;
+
+  } catch (err) {
+    clearTimeout(timeoutId);
+
+    if (err.name === 'AbortError') {
+      console.warn(
+        `[PhishGuard] Safe Browsing timed out after ${TIMEOUT_SAFE_BROWSING_MS}ms. ` +
+        'Results will be retried on next analysis.'
+      );
+    } else {
+      console.warn('[PhishGuard] Safe Browsing network error:', err.message);
+    }
+
+    // Error-flag so cache uses short TTL → we'll retry quickly
+    return Object.fromEntries(
+      urls.map(u => [u, { malicious: false, threatTypes: [], error: true }])
+    );
+  }
+}
+
+// ─── URLhaus community blacklist ──────────────────────────────────────────────
+//
+// URLhaus (abuse.ch) is a free, no-key community feed of malware distribution
+// and phishing URLs.  The API is per-URL (no batch endpoint), so we only call
+// it for URLs that Safe Browsing returned CLEAN, keeping total latency low.
+//
+// Returns: { [url]: { malicious: bool, urlStatus: string, tags: string[], error: bool } }
+//
+//   malicious:  true only when url_status === 'online' (still actively serving threats)
+//   urlStatus:  'online' | 'offline' — 'offline' entries are flagged as informational
+//   tags:       URLhaus classification tags, e.g. ['phishing', 'malware', 'elf']
+//
+// Fail-safe: any error returns { malicious: false, tags: [], error: true }.
+
+async function checkCommunityBlacklist(urls) {
+  if (urls.length === 0) return {};
+
+  // Fire all lookups in parallel — URLhaus rate limits per IP, not per request,
+  // and a typical email has far fewer than 10 links so this is safe.
+  const entries = await Promise.all(
+    urls.map(async url => [url, await lookupUrlhaus(url)])
+  );
+
+  return Object.fromEntries(entries);
+}
+
+async function lookupUrlhaus(url) {
+  const controller = new AbortController();
+  const timeoutId  = setTimeout(() => controller.abort(), TIMEOUT_URLHAUS_MS);
+
+  try {
+    // URLhaus uses form encoding, not JSON
+    const response = await fetch(URLHAUS_ENDPOINT, {
+      method:  'POST',
+      signal:  controller.signal,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body:    new URLSearchParams({ url }).toString(),
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      console.warn(`[PhishGuard] URLhaus HTTP ${response.status} for ${url}`);
+      return { malicious: false, tags: [], error: true };
     }
 
     const data = await response.json();
 
-    // build a lookup map: url -> { malicious, threatTypes }
-    // start with everything as clean, then mark the flagged ones
-    const fetchedResults = {};
-    for (const url of batch) {
-      fetchedResults[url] = { malicious: false, threatTypes: [] };
+    if (data.query_status === 'no_results') {
+      // Not in URLhaus — clean
+      return { malicious: false, urlStatus: null, tags: [], error: false };
     }
 
-    // data.matches is an array of threat matches — each one has a .threat.url
-    // and a .threatType telling us what kind of threat it is
-    if (data.matches && data.matches.length > 0) {
-      for (const match of data.matches) {
-        const matchedUrl = match.threat.url;
-        if (fetchedResults[matchedUrl]) {
-          fetchedResults[matchedUrl].malicious = true;
-          fetchedResults[matchedUrl].threatTypes.push(match.threatType);
-        }
-      }
+    if (data.query_status === 'isListed') {
+      // 'online'  → URL is actively serving threats → flag as malicious
+      // 'offline' → URL has been taken down → informational only (lower confidence)
+      return {
+        malicious:  data.url_status === 'online',
+        urlStatus:  data.url_status,
+        tags:       data.tags || [],
+        urlhausId:  data.id,
+        error:      false,
+      };
     }
 
-    // cache all the results we just fetched so we don't hit the API again soon
-    for (const [url, result] of Object.entries(fetchedResults)) {
-      sbCache.set(url, { data: result, timestamp: now });
-    }
+    // Unexpected status — treat as clean, log for diagnostics
+    console.warn('[PhishGuard] URLhaus unexpected query_status:', data.query_status, 'for', url);
+    return { malicious: false, tags: [], error: false };
 
-    // return cached + freshly fetched results together
-    return { ...cachedResults, ...fetchedResults };
-
-  } catch (error) {
+  } catch (err) {
     clearTimeout(timeoutId);
 
-    if (error.name === 'AbortError') {
-      // fetch timed out — just continue without SB results, don't crash the whole analysis
-      console.warn('[PhishGuard] Safe Browsing request timed out, skipping');
+    if (err.name === 'AbortError') {
+      console.warn(`[PhishGuard] URLhaus timed out (${TIMEOUT_URLHAUS_MS}ms) for ${url}`);
     } else {
-      console.warn('[PhishGuard] Safe Browsing fetch failed:', error.message);
+      console.warn('[PhishGuard] URLhaus network error for', url, ':', err.message);
     }
 
-    return cachedResults; // return whatever we had cached at least
+    return { malicious: false, tags: [], error: true };
   }
 }
 
-// ─── Rule-based analysis (unchanged) ─────────────────────────────────────────
+// ─── Verdict merge ────────────────────────────────────────────────────────────
+//
+// Combines SB and URLhaus into a single unified verdict.
+// Two independent sources agreeing is stronger evidence than either alone,
+// hence bothSourcesMalicious < safeBrowsingMalicious + urlhausMalicious
+// (we do not simply add them — that would create inflation).
 
-function runRuleBasedAnalysis(emailData) {
-  const indicators = [];
-  let totalScore = 0;
+function mergeVerdicts(sbVerdict, uhVerdict) {
+  const bothConfirmed     = sbVerdict.malicious && uhVerdict.malicious;
+  const anyMalicious      = sbVerdict.malicious || uhVerdict.malicious;
+  const urlhausOfflineOnly =
+    uhVerdict.malicious && uhVerdict.urlStatus === 'offline' && !sbVerdict.malicious;
 
-  // URL Analysis (40 points)
-  // links are now objects with { href, text, title, displayedDomain, actualDomain }
-  // we pull out .href for all the string-based checks, same as before
-  if (emailData.links && emailData.links.length > 0) {
-    const firedBrands = new Set();
-
-    emailData.links.forEach(link => {
-      const url = typeof link === 'string' ? link : (link.href || '');
-      if (!url) return;
-
-      if (/\.(tk|ml|ga|cf|gq)$/i.test(url)) {
-        indicators.push('⚠️ Suspicious domain extension (.tk, .ml, .ga)');
-        totalScore += 15;
-      }
-
-      if (/https?:\/\/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/.test(url)) {
-        indicators.push('⚠️ IP address used instead of domain name');
-        totalScore += 20;
-      }
-
-      if (/bit\.ly|tinyurl|goo\.gl|ow\.ly|t\.co/i.test(url)) {
-        indicators.push('⚠️ URL shortener detected (hides destination)');
-        totalScore += 10;
-      }
-
-      const commonBrands = ['paypal', 'amazon', 'microsoft', 'apple', 'facebook', 'bank'];
-      commonBrands.forEach(brand => {
-        if (firedBrands.has(brand)) return;
-        const typoPattern = new RegExp(brand.replace(/o/g, '[o0]').replace(/l/g, '[l1]').replace(/a/g, '[a4]'), 'i');
-        if (typoPattern.test(url) && !url.toLowerCase().includes(brand + '.com') && !url.includes('google.com/url')) {
-          indicators.push(`🚨 Possible ${brand.toUpperCase()} brand impersonation in URL`);
-          totalScore += 25;
-          firedBrands.add(brand);
-        }
-      });
-
-      const subdomains = url.split('//')[1]?.split('/')[0]?.split('.') || [];
-      if (subdomains.length > 4) {
-        indicators.push('⚠️ Excessive subdomains (suspicious structure)');
-        totalScore += 12;
-      }
-
-      // domain mismatch check — only possible now that links are objects.
-      // this is one of the most common phishing tricks: show "www.paypal.com" as
-      // the link text but actually point to a completely different domain.
-      if (link.displayedDomain && link.actualDomain &&
-          link.displayedDomain !== link.actualDomain) {
-        indicators.push(`🚨 Link text shows "${link.displayedDomain}" but goes to "${link.actualDomain}"`);
-        totalScore += 30;
-      }
-    });
+  const sources = [];
+  if (sbVerdict.malicious) {
+    sources.push({ name: 'Google Safe Browsing', types: sbVerdict.threatTypes });
   }
-
-  // Sender Analysis (30 points)
-  const senderEmail = emailData.sender.toLowerCase();
-  const displayName = emailData.displayName.toLowerCase();
-  const freeProviders = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com'];
-  const corporateNames = ['paypal', 'amazon', 'microsoft', 'apple', 'bank', 'irs', 'support', 'security', 'admin'];
-
-  if (freeProviders.some(p => senderEmail.includes(p))) {
-    if (corporateNames.some(c => displayName.includes(c))) {
-      indicators.push('🚨 Corporate name using free email provider');
-      totalScore += 20;
-    }
-  }
-
-  const emailDomain = senderEmail.split('@')[1] || '';
-  const domainBase = emailDomain.split('.')[0];
-
-  if (displayName && domainBase && !displayName.includes(domainBase)) {
-    if (corporateNames.some(c => displayName.includes(c))) {
-      indicators.push('⚠️ Display name does not match sender domain');
-      totalScore += 18;
-    }
-  }
-  
-  if (/\.(biz|info|xyz|top|click|link)\.\w{2}$/.test(emailDomain) ||
-      /\.(biz|info|xyz|top|click)$/.test(emailDomain)) {
-    indicators.push('⚠️ Sender uses suspicious domain structure');
-    totalScore += 15;
-  }
-
-  // Excessive subdomains in sender domain (more than 3 dots)
-  if ((emailDomain.match(/\./g) || []).length > 3) {
-    indicators.push('🚨 Sender domain has excessive subdomains');
-    totalScore += 20;
-  }
-
-  // Content Analysis (30 points)
-  const bodyLower = emailData.body.toLowerCase();
-  const subjectLower = emailData.subject.toLowerCase();
-  const fullText = bodyLower + ' ' + subjectLower;
-
-  const urgencyWords = ['urgent', 'immediate', 'expire', 'suspended', 'verify now', 'act now', 'limited time', 'within 24 hours', 'account will be closed'];
-  const urgencyCount = urgencyWords.filter(w => fullText.includes(w)).length;
-
-  if (urgencyCount >= 2) {
-    indicators.push('⚠️ Multiple urgency keywords detected');
-    totalScore += 15;
-  } else if (urgencyCount === 1) {
-    indicators.push('⚠️ Urgency language used');
-    totalScore += 8;
-  }
-
-  if (/dear (customer|user|member|sir|madam|valued customer)/i.test(emailData.body)) {
-    indicators.push('⚠️ Generic greeting (no personalization)');
-    totalScore += 10;
-  }
-
-  if (/password|credit card|social security|ssn|account number|pin code|cvv|verify.*account|confirm.*identity/i.test(fullText)) {
-    indicators.push('🚨 Requests sensitive information');
-    totalScore += 25;
-  }
-
-  if (/account.*(closed|suspended|locked|terminated)|legal action|unauthorized.*activity|unusual.*activity/i.test(fullText)) {
-    indicators.push('⚠️ Contains threats or alarming warnings');
-    totalScore += 15;
-  }
-
-  if (/click.*here|click.*below|update.*now|verify.*now/i.test(fullText) && emailData.links.length > 0) {
-    indicators.push('⚠️ Pressures user to click links');
-    totalScore += 10;
-  }
-
-  // Grammar and spelling issues (simple check)
-  const misspellings = ['recieve', 'seperate', 'occured', 'bussiness', 'adress'];
-  if (misspellings.some(word => fullText.includes(word))) {
-    indicators.push('⚠️ Spelling errors detected');
-    totalScore += 8;
-  }
-
-  if (indicators.length === 0) {
-    indicators.push('✓ No significant phishing indicators detected');
+  if (uhVerdict.malicious) {
+    sources.push({ name: 'URLhaus', tags: uhVerdict.tags, status: uhVerdict.urlStatus });
   }
 
   return {
-    score: Math.min(totalScore, 100),
-    indicators
+    malicious:          anyMalicious,
+    bothConfirmed,
+    urlhausOfflineOnly,
+    sources,
+    error:              sbVerdict.error || uhVerdict.error,
   };
+}
+
+// ─── Single-URL scoring ───────────────────────────────────────────────────────
+//
+// Applies the de-duplication contract: if the heuristic layer already flagged
+// brand impersonation, external confirmation earns a smaller bonus weight
+// rather than the full fresh-signal weight.
+
+function scoreSingleVerdict(url, verdict, heuristicFlags) {
+  if (!verdict.malicious) return { points: 0, label: null };
+
+  const alreadyFlagged = heuristicFlags?.hasBrandImpersonation ?? false;
+  const sourceNames    = verdict.sources.map(s => s.name).join(' + ');
+
+  // Previously malicious but now offline — informational, very low weight
+  if (verdict.urlhausOfflineOnly) {
+    return {
+      points: alreadyFlagged ? 0 : 10,
+      label:  `⚠️ URLhaus: previously malicious URL (now offline): ${url}`,
+    };
+  }
+
+  let points;
+  if (verdict.bothConfirmed) {
+    points = alreadyFlagged
+      ? EXTERNAL_SCORES.safeBrowsingConfirmBonus + EXTERNAL_SCORES.urlhausConfirmBonus
+      : EXTERNAL_SCORES.bothSourcesMalicious;
+  } else if (verdict.sources[0]?.name === 'Google Safe Browsing') {
+    points = alreadyFlagged
+      ? EXTERNAL_SCORES.safeBrowsingConfirmBonus
+      : EXTERNAL_SCORES.safeBrowsingMalicious;
+  } else {
+    // URLhaus-only hit
+    points = alreadyFlagged
+      ? EXTERNAL_SCORES.urlhausConfirmBonus
+      : EXTERNAL_SCORES.urlhausMalicious;
+  }
+
+  const overlapNote = alreadyFlagged ? ' [heuristic overlap — partial credit]' : '';
+  const label = `🚨 ${sourceNames}: malicious URL confirmed${overlapNote}: ${url}`;
+
+  return { points, label };
+}
+
+// ─── Reputation cache helpers ─────────────────────────────────────────────────
+
+// Separates a URL list into those with a valid cache entry vs. those that need
+// a live network check.  Uses the per-entry TTL (malicious / clean / error tiers).
+function partitionByCacheState(urls) {
+  const now       = Date.now();
+  const cached    = {};
+  const unchecked = [];
+
+  for (const url of urls) {
+    const entry = reputationCache.get(url);
+    if (entry && (now - entry.timestamp < entry.ttl)) {
+      cached[url] = entry.verdict;
+    } else {
+      unchecked.push(url);
+    }
+  }
+
+  return { cached, unchecked };
+}
+
+// ─── Link normalization ───────────────────────────────────────────────────────
+
+// Accepts both plain-string links (old gmail-parser format) and link objects
+// { href, displayedDomain, actualDomain, … } (current format).
+function normalizeLinks(links) {
+  if (!links || links.length === 0) return [];
+  return links
+    .map(link => typeof link === 'string' ? link : (link.href || ''))
+    .filter(url => url.length > 0);
 }
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
 function getRiskLevel(score) {
-  if (score <= 30) return 'low';
-  if (score <= 60) return 'medium';
+  if (score < 30) return 'low';
+  if (score < 60) return 'medium';
   return 'high';
 }
 
@@ -409,83 +540,49 @@ function generateCacheKey(emailData) {
   return `${emailData.sender}:${emailData.subject}:${emailData.body.substring(0, 100)}`;
 }
 
-// clean out expired entries from both caches so memory doesn't grow forever
 function cleanCache() {
   const now = Date.now();
 
   for (const [key, value] of analysisCache.entries()) {
-    if (now - value.timestamp > CACHE_DURATION) {
-      analysisCache.delete(key);
-    }
+    if (now - value.timestamp > CACHE_DURATION) analysisCache.delete(key);
   }
 
-  for (const [key, value] of sbCache.entries()) {
-    if (now - value.timestamp > SB_CACHE_DURATION) {
-      sbCache.delete(key);
-    }
+  // Reputation cache uses per-entry TTL (not a global constant)
+  for (const [key, entry] of reputationCache.entries()) {
+    if (now - entry.timestamp > entry.ttl) reputationCache.delete(key);
   }
 }
 
 chrome.runtime.onStartup.addListener(() => {
-  // service workers can be killed and restarted by Chrome at any time,
-  // so in-memory caches get wiped on restart anyway — this is just explicit cleanup
   analysisCache.clear();
-  sbCache.clear();
+  reputationCache.clear();
 });
 
-// ─── Dev helper: Safe Browsing sanity check ───────────────────────────────────
+// ─── Dev helper ───────────────────────────────────────────────────────────────
 //
-// To run this, open chrome://extensions → find PhishGuard → click "service worker"
-// to open its DevTools console, then type: testSafeBrowsing()
-//
-// It hits the API with one known-clean URL and one that Google permanently keeps
-// flagged for exactly this kind of testing, so you can verify both paths work.
+// Open chrome://extensions → PhishGuard → "service worker" DevTools console,
+// then call:  testExternalReputation()
 
-async function testSafeBrowsing() {
-  console.log('[PhishGuard test] Starting Safe Browsing API check...');
+async function testExternalReputation() {
+  console.log('[PhishGuard test] Testing external reputation checks …\n');
 
-  if (!SAFE_BROWSING_API_KEY || SAFE_BROWSING_API_KEY === 'YOUR_API_KEY_HERE') {
-    console.warn('[PhishGuard test] ✗ No API key set — add your key to SAFE_BROWSING_API_KEY in service-worker.js');
-    return;
-  }
-
-  // Google maintains these test URLs permanently for this exact purpose:
-  // the phishing one is always flagged, google.com is always clean
   const TEST_URLS = [
-    'https://testsafebrowsing.appspot.com/s/phishing.html', // should come back malicious
-    'https://google.com',                                    // should come back clean
+    'https://testsafebrowsing.appspot.com/s/phishing.html', // SB always flags this
+    'https://google.com',                                    // always clean
   ];
 
-  // bypass the sbCache so we always make a real network call during the test
-  // (otherwise a cached result could mask a broken API key)
-  const savedCache = new Map(sbCache);
-  TEST_URLS.forEach(url => sbCache.delete(url));
+  // Flush cache so we always make live network calls during the test
+  TEST_URLS.forEach(url => reputationCache.delete(url));
 
-  try {
-    const results = await checkSafeBrowsing(TEST_URLS);
+  const result = await checkExternalReputation(TEST_URLS, {});
 
-    const flagged = results['https://testsafebrowsing.appspot.com/s/phishing.html'];
-    const clean   = results['https://google.com'];
+  console.log('Score:',      result.score);
+  console.log('Indicators:', result.indicators);
 
-    const flaggedOk = flagged?.malicious === true;
-    const cleanOk   = clean?.malicious   === false;
-
-    if (flaggedOk && cleanOk) {
-      console.log('[PhishGuard test] ✓ API is working correctly');
-      console.log('  → known-malicious URL flagged:', flagged.threatTypes.join(', '));
-      console.log('  → google.com returned clean ✓');
-    } else {
-      if (!flaggedOk) console.warn('[PhishGuard test] ✗ Known-malicious URL was NOT flagged — check your API key and quota');
-      if (!cleanOk)   console.warn('[PhishGuard test] ✗ google.com came back as malicious — something is very wrong');
-    }
-
-  } catch (err) {
-    console.error('[PhishGuard test] ✗ Test failed with error:', err.message);
-  } finally {
-    // restore the cache to how it was before the test ran
-    TEST_URLS.forEach(url => {
-      if (savedCache.has(url)) sbCache.set(url, savedCache.get(url));
-      else sbCache.delete(url);
-    });
-  }
+  const testUrlFlagged = result.indicators.some(i => i.includes('testsafebrowsing'));
+  console.log(
+    testUrlFlagged
+      ? '✓ Known-malicious URL was correctly flagged'
+      : '✗ Known-malicious URL was NOT flagged — verify your API key and quota'
+  );
 }
